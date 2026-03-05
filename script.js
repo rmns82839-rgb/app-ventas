@@ -1,3 +1,4 @@
+// --- CONFIGURACIÓN DE GRUPOS ---
 const grupos = {
     "1111": { nombre: "Grupo A", lider: "Juan Perez" },
     "2222": { nombre: "Grupo B", lider: "Andrés López" },
@@ -10,11 +11,58 @@ let movimientos = [];
 let historialActividad = [];
 const PIN_ADMIN = "0000";
 
+// --- URL DE TU SERVIDOR EN RENDER ---
+const API_URL = "https://app-ventas-0bo2.onrender.com/api";
+
+// --- CARGA INICIAL DE DATOS DESDE LA NUBE ---
+async function cargarDatosDesdeNube() {
+    try {
+        const res = await fetch(`${API_URL}/movimientos`);
+        const datos = await res.json();
+        if (datos && datos.length > 0) {
+            // Sincronizamos los datos y convertimos montos a números
+            movimientos = datos.map(m => ({
+                ...m,
+                total: parseFloat(m.total),
+                saldo: parseFloat(m.saldo)
+            }));
+            actualizarTodo();
+            registrarEnHistorial("NUBE", "☁️ Datos sincronizados con Aiven", "blue");
+        }
+    } catch (e) {
+        console.error("Error al conectar con la nube:", e);
+        registrarEnHistorial("CONEXIÓN", "❌ Trabajando en modo local (Servidor offline)", "red");
+    }
+}
+
+// --- FUNCIÓN PARA SUBIR FOTOS A CLOUDINARY ---
+async function subirACloudinary(file) {
+    const reader = new FileReader();
+    return new Promise((resolve, reject) => {
+        reader.readAsDataURL(file);
+        reader.onloadend = async () => {
+            try {
+                const res = await fetch(`${API_URL}/subir-foto`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ data: reader.result })
+                });
+                const data = await res.json();
+                resolve(data.url);
+            } catch (err) {
+                console.error("Error subiendo foto:", err);
+                reject(err);
+            }
+        };
+    });
+}
+
 // --- ACCESO Y SEGURIDAD ---
 
 function togglePassword() {
     const p = document.getElementById('pinAcceso');
     const eye = document.getElementById('eyeIcon');
+    if (!p) return;
     p.type = p.type === "password" ? "text" : "password";
     if(eye) eye.classList.toggle('fa-eye-slash');
 }
@@ -28,6 +76,9 @@ function validarAcceso() {
         document.getElementById('infoGrupo').innerText = `Vendedor: ${grupoActivo.lider} | ${grupoActivo.nombre}`;
         
         registrarEnHistorial("SESIÓN", `El líder ${grupoActivo.lider} inició sesión`, "blue");
+        
+        // Cargar datos automáticamente al entrar
+        cargarDatosDesdeNube();
     } else {
         document.getElementById('errorLogin').classList.remove('hidden');
     }
@@ -41,7 +92,7 @@ function toggleManualPrice() {
     if(divManual) divManual.classList.toggle('hidden', s.value !== 'manual');
 }
 
-function agregarMovimiento() {
+async function agregarMovimiento() {
     const cliInput = document.getElementById('cliente');
     const tipoInput = document.getElementById('tipoMov');
     const s = document.getElementById('selectActividad');
@@ -59,8 +110,20 @@ function agregarMovimiento() {
         return alert("Por favor, ingrese un valor válido");
     }
 
+    // Notificar inicio de proceso
+    registrarEnHistorial("NUBE", "⏳ Procesando registro y subiendo evidencia...", "orange");
+
+    // Manejo de la evidencia (Cloudinary)
+    let urlEvidencia = null;
+    if (fotoInput && fotoInput.files[0]) {
+        try {
+            urlEvidencia = await subirACloudinary(fotoInput.files[0]);
+        } catch (e) {
+            alert("Error al subir la foto, se registrará sin evidencia.");
+        }
+    }
+
     const nuevo = {
-        id: Date.now(),
         vendedor: grupoActivo.lider,
         cliente: cli.toUpperCase(),
         tipo: tipo,
@@ -68,17 +131,28 @@ function agregarMovimiento() {
         concepto: s.options[s.selectedIndex].text.split(' (')[0],
         total: unitario * cant,
         saldo: tipo === 'DEUDA' ? unitario * cant : 0,
-        fecha: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        evidencia: fotoInput && fotoInput.files[0] ? URL.createObjectURL(fotoInput.files[0]) : null 
+        fecha: new Date().toLocaleString(),
+        evidencia: urlEvidencia 
     };
 
-    movimientos.unshift(nuevo);
-    
-    // Historial dinámico según el tipo
-    const emoji = tipo === 'DEUDA' ? '⚠️' : '✅';
-    registrarEnHistorial(tipo, `${emoji} ${nuevo.vendedor} registró ${nuevo.concepto} a ${nuevo.cliente} por $${nuevo.total.toLocaleString()}`, tipo === 'DEUDA' ? "yellow" : "green");
-    
-    actualizarTodo();
+    // GUARDAR EN AIVEN (VIA RENDER)
+    try {
+        const respuesta = await fetch(`${API_URL}/movimientos`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(nuevo)
+        });
+
+        if (respuesta.ok) {
+            // Solo lo agregamos a la lista si se guardó en la nube
+            movimientos.unshift(nuevo);
+            const emoji = tipo === 'DEUDA' ? '⚠️' : '✅';
+            registrarEnHistorial(tipo, `${emoji} Sincronizado: ${nuevo.concepto} a ${nuevo.cliente}`, tipo === 'DEUDA' ? "yellow" : "green");
+            actualizarTodo();
+        }
+    } catch (error) {
+        alert("Error crítico: No se pudo guardar en la base de datos.");
+    }
     
     // Resetear formulario
     cliInput.value = "";
@@ -119,37 +193,38 @@ function renderizarHistorial() {
 function eliminarMov(id) {
     const pin = prompt("SEGURIDAD: Ingrese PIN de Administrador para eliminar:");
     if (pin === PIN_ADMIN) {
-        const m = movimientos.find(mov => mov.id === id);
-        
-        registrarEnHistorial(
-            "ELIMINADO", 
-            `❌ ${grupoActivo.lider} borró registro de ${m.cliente} ($${m.total.toLocaleString()})`, 
-            "red"
-        );
-
+        // En una app real aquí enviarías un DELETE al servidor. Por ahora lo borramos visualmente.
         movimientos = movimientos.filter(m => m.id !== id);
+        registrarEnHistorial("ELIMINADO", "❌ Registro borrado por el Administrador", "red");
         actualizarTodo();
     } else if (pin !== null) {
         alert("PIN Incorrecto");
     }
 }
 
-function pagarDeuda(id) {
+async function pagarDeuda(id) {
     const mov = movimientos.find(m => m.id === id);
     const abonoInput = prompt(`Saldo de ${mov.cliente}: $${mov.saldo}. ¿Cuánto paga?`, mov.saldo);
     
     if (abonoInput !== null) {
         const abono = parseFloat(abonoInput);
         if (!isNaN(abono) && abono > 0 && abono <= mov.saldo) {
-            mov.saldo -= abono;
             
-            registrarEnHistorial(
-                "PAGO", 
-                `💰 ${grupoActivo.lider} recibió abono de $${abono.toLocaleString()} de ${mov.cliente}`, 
-                "blue"
-            );
+            try {
+                const res = await fetch(`${API_URL}/pagar`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: id, abono: abono })
+                });
 
-            actualizarTodo();
+                if (res.ok) {
+                    mov.saldo -= abono;
+                    registrarEnHistorial("PAGO", `💰 Abono de $${abono.toLocaleString()} de ${mov.cliente} registrado en nube`, "blue");
+                    actualizarTodo();
+                }
+            } catch (e) {
+                alert("Error al procesar el pago en el servidor.");
+            }
         } else {
             alert("Cantidad no válida");
         }
@@ -166,12 +241,10 @@ function actualizarTodo() {
     cuerpo.innerHTML = "";
 
     movimientos.forEach(m => {
-        // Lógica financiera: Solo sumamos a ventas lo que NO es deuda, 
-        // o la diferencia pagada de una deuda.
         if (m.tipo === 'VENTA') v += m.total;
         if (m.tipo === 'DEUDA') {
             d += m.saldo;
-            v += (m.total - m.saldo); // Lo que ya se abonó de la deuda cuenta como venta
+            v += (m.total - m.saldo); 
         }
         if (m.tipo === 'RETIRO') r += m.total;
 
